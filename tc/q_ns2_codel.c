@@ -180,7 +180,7 @@ static int codel_print_xstats(struct qdisc_util *qu, FILE *f,
 
 }
 
-struct qdisc_util codel_qdisc_util = {
+struct qdisc_util ns2_codel_qdisc_util = {
 	.id		= "ns2_codel",
 	.parse_qopt	= codel_parse_opt,
 	.print_qopt	= codel_print_opt,
