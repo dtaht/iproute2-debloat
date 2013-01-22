@@ -15,6 +15,7 @@
 #include "br_common.h"
 
 struct rtnl_handle rth = { .fd = -1 };
+int preferred_family = AF_UNSPEC;
 int resolve_hosts;
 int show_stats;
 int show_details;
@@ -26,7 +27,7 @@ static void usage(void)
 {
 	fprintf(stderr,
 "Usage: bridge [ OPTIONS ] OBJECT { COMMAND | help }\n"
-"where  OBJECT := { fdb |  monitor }\n"
+"where  OBJECT := { fdb |  mdb | monitor }\n"
 "       OPTIONS := { -V[ersion] | -s[tatistics] | -d[etails]\n" );
 	exit(-1);
 }
@@ -42,6 +43,7 @@ static const struct cmd {
 	int (*func)(int argc, char **argv);
 } cmds[] = {
 	{ "fdb", 	do_fdb },
+	{ "mdb", 	do_mdb },
 	{ "monitor",	do_monitor },
 	{ "help",	do_help },
 	{ 0 }
@@ -86,6 +88,23 @@ main(int argc, char **argv)
 			++show_details;
 		} else if (matches(opt, "-timestamp") == 0) {
 			++timestamp;
+                } else if (matches(opt, "-family") == 0) {
+			argc--;
+			argv++;
+			if (argc <= 1)
+				usage();
+			if (strcmp(argv[1], "inet") == 0)
+				preferred_family = AF_INET;
+			else if (strcmp(argv[1], "inet6") == 0)
+				preferred_family = AF_INET6;
+			else if (strcmp(argv[1], "help") == 0)
+				usage();
+			else
+				invarg("invalid protocol family", argv[1]);
+		} else if (strcmp(opt, "-4") == 0) {
+			preferred_family = AF_INET;
+		} else if (strcmp(opt, "-6") == 0) {
+			preferred_family = AF_INET6;
 		} else {
 			fprintf(stderr, "Option \"%s\" is unknown, try \"bridge help\".\n", opt);
 			exit(-1);

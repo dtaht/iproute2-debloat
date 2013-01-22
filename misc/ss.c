@@ -22,7 +22,6 @@
 #include <errno.h>
 #include <netdb.h>
 #include <arpa/inet.h>
-#include <resolv.h>
 #include <dirent.h>
 #include <fnmatch.h>
 #include <getopt.h>
@@ -106,7 +105,7 @@ struct filter
 };
 
 struct filter default_filter = {
-	.dbs	=  (1<<TCP_DB),
+	.dbs	=  ~0,
 	.states = SS_ALL & ~((1<<SS_LISTEN)|(1<<SS_CLOSE)|(1<<SS_TIME_WAIT)|(1<<SS_SYN_RECV)),
 	.families= (1<<AF_INET)|(1<<AF_INET6),
 };
@@ -1431,7 +1430,7 @@ static void tcp_show_info(const struct nlmsghdr *nlh, struct inet_diag_msg *r)
 	}
 }
 
-static int tcp_show_sock(struct nlmsghdr *nlh, struct filter *f)
+static int inet_show_sock(struct nlmsghdr *nlh, struct filter *f)
 {
 	struct inet_diag_msg *r = NLMSG_DATA(nlh);
 	struct tcpstat s;
@@ -1495,9 +1494,8 @@ static int tcp_show_sock(struct nlmsghdr *nlh, struct filter *f)
 	return 0;
 }
 
-static int tcp_show_netlink(struct filter *f, FILE *dump_fp, int socktype)
+static int tcpdiag_send(int fd, int protocol, struct filter *f)
 {
-	int fd;
 	struct sockaddr_nl nladdr;
 	struct {
 		struct nlmsghdr nlh;
@@ -1507,17 +1505,19 @@ static int tcp_show_netlink(struct filter *f, FILE *dump_fp, int socktype)
 	int	bclen;
 	struct msghdr msg;
 	struct rtattr rta;
-	char	buf[8192];
 	struct iovec iov[3];
 
-	if ((fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_INET_DIAG)) < 0)
+	if (protocol == IPPROTO_UDP)
 		return -1;
 
 	memset(&nladdr, 0, sizeof(nladdr));
 	nladdr.nl_family = AF_NETLINK;
 
 	req.nlh.nlmsg_len = sizeof(req);
-	req.nlh.nlmsg_type = socktype;
+	if (protocol == IPPROTO_TCP)
+		req.nlh.nlmsg_type = TCPDIAG_GETSOCK;
+	else
+		req.nlh.nlmsg_type = DCCPDIAG_GETSOCK;
 	req.nlh.nlmsg_flags = NLM_F_ROOT|NLM_F_MATCH|NLM_F_REQUEST;
 	req.nlh.nlmsg_pid = 0;
 	req.nlh.nlmsg_seq = 123456;
@@ -1559,6 +1559,95 @@ static int tcp_show_netlink(struct filter *f, FILE *dump_fp, int socktype)
 		close(fd);
 		return -1;
 	}
+
+	return 0;
+}
+
+static int sockdiag_send(int family, int fd, int protocol, struct filter *f)
+{
+	struct sockaddr_nl nladdr;
+	struct {
+		struct nlmsghdr nlh;
+		struct inet_diag_req_v2 r;
+	} req;
+	char    *bc = NULL;
+	int	bclen;
+	struct msghdr msg;
+	struct rtattr rta;
+	struct iovec iov[3];
+
+	if (family == PF_UNSPEC)
+		return tcpdiag_send(fd, protocol, f);
+
+	memset(&nladdr, 0, sizeof(nladdr));
+	nladdr.nl_family = AF_NETLINK;
+
+	req.nlh.nlmsg_len = sizeof(req);
+	req.nlh.nlmsg_type = SOCK_DIAG_BY_FAMILY;
+	req.nlh.nlmsg_flags = NLM_F_ROOT|NLM_F_MATCH|NLM_F_REQUEST;
+	req.nlh.nlmsg_pid = 0;
+	req.nlh.nlmsg_seq = 123456;
+	memset(&req.r, 0, sizeof(req.r));
+	req.r.sdiag_family = family;
+	req.r.sdiag_protocol = protocol;
+	req.r.idiag_states = f->states;
+	if (show_mem) {
+		req.r.idiag_ext |= (1<<(INET_DIAG_MEMINFO-1));
+		req.r.idiag_ext |= (1<<(INET_DIAG_SKMEMINFO-1));
+	}
+
+	if (show_tcpinfo) {
+		req.r.idiag_ext |= (1<<(INET_DIAG_INFO-1));
+		req.r.idiag_ext |= (1<<(INET_DIAG_VEGASINFO-1));
+		req.r.idiag_ext |= (1<<(INET_DIAG_CONG-1));
+	}
+
+	iov[0] = (struct iovec){
+		.iov_base = &req,
+		.iov_len = sizeof(req)
+	};
+	if (f->f) {
+		bclen = ssfilter_bytecompile(f->f, &bc);
+		rta.rta_type = INET_DIAG_REQ_BYTECODE;
+		rta.rta_len = RTA_LENGTH(bclen);
+		iov[1] = (struct iovec){ &rta, sizeof(rta) };
+		iov[2] = (struct iovec){ bc, bclen };
+		req.nlh.nlmsg_len += RTA_LENGTH(bclen);
+	}
+
+	msg = (struct msghdr) {
+		.msg_name = (void*)&nladdr,
+		.msg_namelen = sizeof(nladdr),
+		.msg_iov = iov,
+		.msg_iovlen = f->f ? 3 : 1,
+	};
+
+	if (sendmsg(fd, &msg, 0) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int inet_show_netlink(struct filter *f, FILE *dump_fp, int protocol)
+{
+	int fd, family;
+	struct sockaddr_nl nladdr;
+	struct msghdr msg;
+	char	buf[8192];
+	struct iovec iov[3];
+
+	if ((fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_INET_DIAG)) < 0)
+		return -1;
+
+	family = PF_INET;
+again:
+	if (sockdiag_send(family, fd, protocol, f))
+		return -1;
+
+	memset(&nladdr, 0, sizeof(nladdr));
+	nladdr.nl_family = AF_NETLINK;
 
 	iov[0] = (struct iovec){
 		.iov_base = buf,
@@ -1602,15 +1691,19 @@ static int tcp_show_netlink(struct filter *f, FILE *dump_fp, int socktype)
 			    h->nlmsg_seq != 123456)
 				goto skip_it;
 
-			if (h->nlmsg_type == NLMSG_DONE) {
-				close(fd);
-				return 0;
-			}
+			if (h->nlmsg_type == NLMSG_DONE)
+				goto done;
+
 			if (h->nlmsg_type == NLMSG_ERROR) {
 				struct nlmsgerr *err = (struct nlmsgerr*)NLMSG_DATA(h);
 				if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr))) {
 					fprintf(stderr, "ERROR truncated\n");
 				} else {
+					if (family != PF_UNSPEC) {
+						family = PF_UNSPEC;
+						goto again;
+					}
+
 					errno = -err->error;
 					if (errno == EOPNOTSUPP) {
 						close(fd);
@@ -1618,15 +1711,15 @@ static int tcp_show_netlink(struct filter *f, FILE *dump_fp, int socktype)
 					}
 					perror("TCPDIAG answers");
 				}
-				close(fd);
-				return 0;
+
+				goto done;
 			}
 			if (!dump_fp) {
 				if (!(f->families & (1<<r->idiag_family))) {
 					h = NLMSG_NEXT(h, status);
 					continue;
 				}
-				err = tcp_show_sock(h, NULL);
+				err = inet_show_sock(h, NULL);
 				if (err < 0) {
 					close(fd);
 					return err;
@@ -1645,6 +1738,12 @@ skip_it:
 			exit(1);
 		}
 	}
+done:
+	if (family == PF_INET) {
+		family = PF_INET6;
+		goto again;
+	}
+
 	close(fd);
 	return 0;
 }
@@ -1699,7 +1798,7 @@ static int tcp_show_netlink_file(struct filter *f)
 			return -1;
 		}
 
-		err = tcp_show_sock(h, f);
+		err = inet_show_sock(h, f);
 		if (err < 0)
 			return err;
 	}
@@ -1717,7 +1816,7 @@ static int tcp_show(struct filter *f, int socktype)
 		return tcp_show_netlink_file(f);
 
 	if (!getenv("PROC_NET_TCP") && !getenv("PROC_ROOT")
-	    && tcp_show_netlink(f, NULL, socktype) == 0)
+	    && inet_show_netlink(f, NULL, socktype) == 0)
 		return 0;
 
 	/* Sigh... We have to parse /proc/net/tcp... */
@@ -1878,6 +1977,10 @@ int dgram_show_line(char *line, const struct filter *f, int family)
 int udp_show(struct filter *f)
 {
 	FILE *fp = NULL;
+
+	if (!getenv("PROC_NET_UDP") && !getenv("PROC_ROOT")
+	    && inet_show_netlink(f, NULL, IPPROTO_UDP) == 0)
+		return 0;
 
 	dg_proto = UDP_PROTO;
 
@@ -2980,7 +3083,7 @@ int main(int argc, char *argv[])
 				exit(-1);
 			}
 		}
-		tcp_show_netlink(&current_filter, dump_fp, TCPDIAG_GETSOCK);
+		inet_show_netlink(&current_filter, dump_fp, IPPROTO_TCP);
 		fflush(dump_fp);
 		exit(0);
 	}
@@ -3048,8 +3151,8 @@ int main(int argc, char *argv[])
 	if (current_filter.dbs & (1<<UDP_DB))
 		udp_show(&current_filter);
 	if (current_filter.dbs & (1<<TCP_DB))
-		tcp_show(&current_filter, TCPDIAG_GETSOCK);
+		tcp_show(&current_filter, IPPROTO_TCP);
 	if (current_filter.dbs & (1<<DCCP_DB))
-		tcp_show(&current_filter, DCCPDIAG_GETSOCK);
+		tcp_show(&current_filter, IPPROTO_DCCP);
 	return 0;
 }
